@@ -1,0 +1,523 @@
+substitutions:
+  # --- API endpoints ---
+  api_url: "http://xxx.xxx.xxx.xxx:8080/api/v2/analytics/species/daily"
+  api_temp_url: "http://xxx.xxx.xxx.xxx:8080/api/v2/system/temperature/cpu"
+  
+  # --- Network ---
+  mqtt_broker: "xxx.xxx.xxx.xxx"
+  
+  # --- Home Assistant entities. Change them if needed. These entities enable features like sleep handling and display refresh. ---
+  entity_abwesenheit: "input_boolean.abwesenheitsmodus"
+  entity_schlaf: "input_boolean.schlafmodus"
+  entity_bird_fact: "sensor.bird_fact"
+
+esphome:
+  name: e-paper-birdbox
+  friendly_name: E-Paper BirdBox
+  on_boot:
+    priority: -100
+    then:
+      - wait_until:
+          wifi.connected:
+      - delay: 35s
+      # Load bird data initially after boot
+      - script.execute: fetch_bird_data
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: ""
+
+globals:
+  # Stores the parsed JSON from the API as a string
+  - id: last_valid_json
+    type: std::string
+    initial_value: '""'
+  # Timestamp of the last successful API request
+  - id: last_update_timestamp
+    type: int
+    initial_value: '0'
+  # Status: 0 = Normal/Awake, 1 = Sleep mode 1 (display blank), 2 = Sleep mode 2 (icon)
+  - id: current_display_state
+    type: int
+    initial_value: '0'
+  # CPU temperature of the host system
+  - id: cpu_temperature
+    type: float
+    initial_value: '0.0'
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "E-Paper-Birdbox Fallback Hotspot"
+    password: ""
+  power_save_mode: light   # light = gentle (default), high = more aggressive
+  fast_connect: True
+  enable_btm: True #Only on esp32. Enable 802.11v BSS Transition Management support.
+  enable_rrm: True #Only on esp32. Enable 802.11k Radio Resource Management support.
+
+captive_portal:
+
+http_request:
+  timeout: 2s
+  verify_ssl: false
+
+image:
+  - file: "moon.stars.fillv2.jpeg"
+    id: sleep_icon
+    type: BINARY
+
+binary_sensor:
+  # checks absence mode
+  - platform: homeassistant
+    id: abwesenheitsmodus
+    entity_id: ${entity_abwesenheit}
+    on_state:
+      then:
+        - script.execute: update_display_state
+
+  # checks sleep mode
+  - platform: homeassistant
+    id: schlafmodus
+    entity_id: ${entity_schlaf}
+    on_state:
+      then:
+        - script.execute: update_display_state
+
+button:
+  - platform: restart
+    name: "BirdBox Neustart"
+    id: restart_button
+
+  - platform: template
+    name: "BirdBox Display Refresh"
+    id: refresh_button
+    icon: "mdi:refresh"
+    on_press:
+      then:
+        # Manual trigger to fetch new data
+        - script.execute: fetch_bird_data
+
+text_sensor:
+  # Retrieves a bird fact text from Home Assistant
+  - platform: homeassistant
+    id: bird_fact
+    entity_id: ${entity_bird_fact}
+    on_value:
+      then:
+        - component.update: my_display
+
+script:
+  # Logic for putting the display to sleep
+  - id: update_display_state
+    mode: single
+    then:
+      - lambda: |-
+          int new_state = 0;
+          if (id(abwesenheitsmodus).state) {
+            new_state = 1;       // Abwesenheit → Display komplett leer
+          } else if (id(schlafmodus).state) {
+            new_state = 2;       // Schlaf → Display mit Icon
+          }
+          if (id(current_display_state) != new_state) {
+            id(current_display_state) = new_state;
+            if (new_state == 0) {
+              id(fetch_bird_data).execute();
+            } else {
+              id(my_display).update();
+            }
+          }
+
+
+  # Fetch JSON data from the configured APIs
+  - id: fetch_bird_data
+    mode: single
+    then:
+      - lambda: |-
+          // Do not fetch data when the system is sleeping
+          if (id(abwesenheitsmodus).state || id(schlafmodus).state) {
+            ESP_LOGI("API", "Sleep mode active. API request skipped.");
+            return;
+          }
+          
+          // --- 1. Request: Bird data ---
+          esp_http_client_config_t config = {};
+          config.url = "${api_url}"; 
+          config.method = HTTP_METHOD_GET;
+          config.timeout_ms = 2000;
+          
+          esp_http_client_handle_t client = esp_http_client_init(&config);
+          if (client != nullptr) {
+            if (esp_http_client_open(client, 0) == ESP_OK) {
+              esp_http_client_fetch_headers(client);
+              if (esp_http_client_get_status_code(client) == 200) {
+                std::string body;
+                body.reserve(4096); 
+                char buffer[512];
+                int read_len;
+                while ((read_len = esp_http_client_read(client, buffer, 512)) > 0) {
+                  body.append(buffer, read_len);
+                  delay(1); 
+                }
+                
+                // Parse the received JSON
+                JsonDocument doc; 
+                DeserializationError error = deserializeJson(doc, body);
+                
+                if (!error) {
+                  JsonDocument out_doc;
+                  int count = 1;
+                  
+                  // Iterate through birds and aggregate 1h blocks into 3h blocks
+                  for (JsonObject bird : doc.as<JsonArray>()) {
+                    if (count > 10) break; // Max 10 birds
+                    std::string key = std::to_string(count);
+                    JsonObject out_bird = out_doc[key].to<JsonObject>();
+                    out_bird["n"] = bird["common_name"];
+                    JsonArray out_d = out_bird["d"].to<JsonArray>();
+                    JsonArray hourly = bird["hourly_counts"];
+                    
+                    for (int block = 0; block < 8; block++) {
+                      int sum = 0;
+                      for (int h = 0; h < 3; h++) {
+                        sum += hourly[block * 3 + h].as<int>();
+                      }
+                      out_d.add(sum);
+                    }
+                    count++;
+                  }
+                  
+                  // Save compressed JSON into the global variable
+                  std::string result;
+                  serializeJson(out_doc, result);
+                  id(last_valid_json) = result;
+                  
+                  // Update the timestamp
+                  auto time = id(ha_time).now();
+                  if (time.is_valid()) id(last_update_timestamp) = time.timestamp;
+                  id(current_display_state) = 0;
+                }
+              }
+            }
+            esp_http_client_cleanup(client);
+          }
+
+          // --- 2. Request: CPU temperature ---
+          esp_http_client_config_t temp_config = {};
+          temp_config.url = "${api_temp_url}";
+          temp_config.method = HTTP_METHOD_GET;
+          temp_config.timeout_ms = 2000;
+
+          esp_http_client_handle_t temp_client = esp_http_client_init(&temp_config);
+          if (temp_client != nullptr) {
+            if (esp_http_client_open(temp_client, 0) == ESP_OK) {
+              esp_http_client_fetch_headers(temp_client);
+              if (esp_http_client_get_status_code(temp_client) == 200) {
+                std::string temp_body;
+                temp_body.reserve(256);
+                char temp_buffer[256];
+                int temp_read_len;
+                while ((temp_read_len = esp_http_client_read(temp_client, temp_buffer, 256)) > 0) {
+                  temp_body.append(temp_buffer, temp_read_len);
+                }
+                
+                JsonDocument temp_doc;
+                if (!deserializeJson(temp_doc, temp_body) && temp_doc["is_available"].as<bool>()) {
+                  id(cpu_temperature) = temp_doc["celsius"].as<float>();
+                }
+              }
+            }
+            esp_http_client_cleanup(temp_client);
+          }
+          
+          // Redraw the display
+          id(my_display).update();
+
+mqtt:
+  broker: "${mqtt_broker}" 
+  port: "1883"
+  username: ""
+  password: ""
+  keepalive: 120s
+
+spi:
+  clk_pin: 18 
+  mosi_pin: 23 
+
+font:
+  - file: "Terminus.ttf"
+    id: font_title
+    size: 20
+    glyphs: ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~äöüÄÖÜß–'
+    
+  - file: "Terminus.ttf"
+    id: font_header
+    size: 12
+    glyphs: ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~äöüÄÖÜß–'
+    
+  - file: "Terminus.ttf"
+    id: font_data
+    size: 14
+    glyphs: ' !"#$%&''()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyz{|}~äöüÄÖÜß–'
+
+time:
+  - platform: homeassistant
+    id: ha_time
+    timezone: "Europe/Berlin"
+
+interval:
+  # Automatic data fetch every 30 minutes
+  - interval: 30min
+    then:
+      - script.execute: fetch_bird_data
+
+display:
+  - platform: waveshare_epaper
+    id: my_display
+    model: 4.20in-bv2-bwr
+    reset_pin: 16 
+    busy_pin: 4 
+    dc_pin: 17 
+    cs_pin: 14 
+    update_interval: never # Updates are triggered explicitly by script
+    reset_duration: 2ms 
+    
+    lambda: |-
+      auto black = Color(0, 0, 0);
+      auto white = Color(255, 255, 255);
+      auto red   = Color(255, 0, 0);
+      
+      // Helper function: draw centered text with automatic line wrapping
+      auto print_wrapped_centered = [&](int center_x, int y, esphome::font::Font *font, Color color, std::string text, int max_w) {
+        std::string current_line = "";
+        std::string word = "";
+        int current_y = y;
+        text += " "; 
+        for (char c : text) {
+          if (c == ' ' || c == '\n') {
+            std::string test_line = current_line + (current_line.empty() ? "" : " ") + word;
+            int x1, y1, w, h;
+            it.get_text_bounds(0, 0, test_line.c_str(), font, TextAlign::TOP_LEFT, &x1, &y1, &w, &h);
+            if (w > max_w && !current_line.empty()) {
+              it.printf(center_x, current_y, font, color, TextAlign::TOP_CENTER, "%s", current_line.c_str());
+              current_y += h + 4;
+              current_line = word;
+            } else {
+              current_line = test_line;
+            }
+            word = "";
+            if (c == '\n') {
+               it.printf(center_x, current_y, font, color, TextAlign::TOP_CENTER, "%s", current_line.c_str());
+               current_y += h + 4;
+               current_line = "";
+            }
+          } else {
+            word += c;
+          }
+        }
+        if (!current_line.empty()) {
+          it.printf(center_x, current_y, font, color, TextAlign::TOP_CENTER, "%s", current_line.c_str());
+        }
+      };
+
+      int state = id(current_display_state);
+      
+      // State 1: display completely white (deep sleep)
+      if (state == 1) {
+        it.fill(white);
+        return;
+      }
+      
+      // State 2: sleep mode with icon
+      if (state == 2) {
+        it.fill(white);
+        it.rectangle(5, 5, 390, 290, black);
+        it.image(125, 50, id(sleep_icon));
+        it.printf(200, 210, id(font_title), black, TextAlign::TOP_CENTER, "BirdBox Bildschirm schläft");
+        it.printf(200, 240, id(font_header), black, TextAlign::TOP_CENTER, "Wird bei Aktivität automatisch geweckt");
+        return; 
+      }
+
+      std::string json_str = id(last_valid_json);
+      
+      // State: awake, but no data yet
+      if (json_str == "\"\"") {
+        it.fill(white);
+        if (id(bird_fact).state.length() > 5) {
+          it.printf(200, 30, id(font_title), black, TextAlign::TOP_CENTER, "BirdBox startet...");
+          print_wrapped_centered(200, 80, id(font_title), black, id(bird_fact).state, 360);
+        } else {
+          it.print(10, 10, id(font_data), black, "Warte auf erste Daten...");
+        }
+        return; 
+      }
+
+      // Prepare data structure for rendering
+      struct BirdData {
+        std::string name;
+        int counts[8] = {0};
+        bool active = false;
+      } birds[10];
+      
+      int active_bird_count = 0;
+
+      // Unpack JSON into the structure
+      json::parse_json(json_str, [&](JsonObject root) -> bool {
+        for (int i = 1; i <= 10; i++) {
+          std::string key = std::to_string(i);
+          JsonObject bird = root[key];
+          if (!bird.isNull()) {
+            birds[i-1].name = bird["n"] | "Unbekannt";
+            birds[i-1].active = true;
+            active_bird_count++;
+            JsonArray data = bird["d"];
+            for(int j = 0; j < 8; j++) {
+              birds[i-1].counts[j] = data[j] | 0;
+            }
+          }
+        }
+        return true;
+      });
+
+      it.fill(white);
+
+      // State: API reachable, but no birds today -> show facts
+      if (active_bird_count == 0) {
+        if (id(bird_fact).state.length() > 5) {
+          it.printf(200, 30, id(font_title), black, TextAlign::TOP_CENTER, "Noch keine Vögel heute!");
+          print_wrapped_centered(200, 80, id(font_title), black, id(bird_fact).state, 360);
+        } else {
+          it.printf(200, 140, id(font_title), black, TextAlign::TOP_CENTER, "Warte auf erste Vögel...");
+        }
+        return;
+      }
+
+      // Calculate ranking (top 3) for each of the 8 columns/time blocks
+      int rank_vals[8][3] = {0};
+      for(int j = 0; j < 8; j++) {
+        std::vector<int> col_vals;
+        for(int i = 0; i < 10; i++) {
+          if(birds[i].active && birds[i].counts[j] > 0) col_vals.push_back(birds[i].counts[j]);
+        }
+        std::sort(col_vals.rbegin(), col_vals.rend());
+        auto last = std::unique(col_vals.begin(), col_vals.end());
+        col_vals.erase(last, col_vals.end());
+        
+        for(size_t k = 0; k < std::min<size_t>(col_vals.size(), 3); k++) {
+          rank_vals[j][k] = col_vals[k];
+        }
+      }
+
+      int start_x = 10, start_y = 5;
+      auto time = id(ha_time).now();
+      int current_block = time.is_valid() ? (time.hour / 3) : -1;
+
+      // Print header
+      it.print(start_x, start_y, id(font_title), black, "Top 10 Vögel Heute"); 
+
+      // Render timestamp and warning icons
+      if (id(last_update_timestamp) > 0) {
+        auto last_time = ESPTime::from_epoch_local(id(last_update_timestamp));
+        // Warning if data is older than 15 min (900s)
+        bool data_stale = time.is_valid() && (time.timestamp - id(last_update_timestamp)) > 900;
+        
+        it.printf(390, start_y + 5, id(font_header), black, TextAlign::TOP_RIGHT, 
+                  "Stand: %02d:%02d%s", last_time.hour, last_time.minute, data_stale ? " (!)" : "");
+
+        // Overtemperature warning icon (thermometer)
+        if (id(cpu_temperature) > 70.0f) {
+          int tx = 285, ty = start_y + 3, th = 13, tw = 7;            
+          it.line(tx, ty, tx - tw, ty + th, red);
+          it.line(tx, ty, tx + tw, ty + th, red);
+          it.line(tx - tw, ty + th, tx + tw, ty + th, red);
+          it.line(tx, ty + 1, tx - tw + 1, ty + th, red);
+          it.line(tx, ty + 1, tx + tw - 1, ty + th, red);
+          it.line(tx - tw + 1, ty + th - 1, tx + tw - 1, ty + th - 1, red);
+          for (int py = ty + 4; py <= ty + 8; py++) {
+            it.draw_pixel_at(tx, py, red);
+            it.draw_pixel_at(tx + 1, py, red); 
+          }
+          it.draw_pixel_at(tx, ty + 10, red);
+          it.draw_pixel_at(tx + 1, ty + 10, red);
+        }
+      }
+
+      // Draw table
+      it.line(start_x, start_y + 24, 390, start_y + 24, black); 
+
+      int y_offset = start_y + 28; 
+      const int x_cols[] = {151, 183, 215, 247, 279, 311, 343, 375};
+      const char* headers[] = {"0h", "3h", "6h", "9h", "12h", "15h", "18h", "21h"};
+      
+      it.print(start_x, y_offset, id(font_header), black, "Art");
+      for (int j = 0; j < 8; j++) {
+        it.print(x_cols[j], y_offset, id(font_header), black, TextAlign::TOP_CENTER, headers[j]);
+      }
+
+      it.line(start_x, y_offset + 15, 390, y_offset + 15, black);
+      y_offset += 20; 
+      int max_y = y_offset; 
+
+      // Iterate entries
+      for (int i = 0; i < 10; i++) { 
+        if (!birds[i].active) continue;
+        
+        it.printf(start_x, y_offset, id(font_data), black, "%.14s", birds[i].name.c_str());
+        
+        for(int j = 0; j < 8; j++) {
+          // Hide future time blocks
+          if (time.is_valid() && j > current_block) continue; 
+          int count = birds[i].counts[j];
+          
+          if (count > 0) {
+            // Determine ranking for highlighting
+            int rank = (count == rank_vals[j][0]) ? 1 : (count == rank_vals[j][1]) ? 2 : (count == rank_vals[j][2]) ? 3 : -1;
+
+            if (rank != -1) {
+              int box_x = x_cols[j] - 15, box_y = y_offset - 4;
+              for(int px = box_x; px < box_x + 31; px++) {
+                for(int py = box_y; py < box_y + 23; py++) {
+                  // Pattern depends on rank (hatch/dots)
+                  if ((rank == 1 && (px + py) % 2 == 0) || 
+                      (rank == 2 && px % 2 == 0 && py % 2 == 0) || 
+                      (rank == 3 && px % 3 == 0 && py % 3 == 0)) {
+                    it.draw_pixel_at(px, py, red);
+                  }
+                }
+              }
+            }
+            it.printf(x_cols[j], y_offset, id(font_data), black, TextAlign::TOP_CENTER, "%d", count);
+          } else {
+            it.printf(x_cols[j], y_offset, id(font_data), black, TextAlign::TOP_CENTER, "-");
+          }
+        }
+        
+        it.line(start_x, y_offset + 20, 390, y_offset + 20, black);
+        y_offset += 25; 
+        max_y = y_offset; 
+      }
+
+      // Highlight the current time block
+      if (time.is_valid() && current_block >= 0 && current_block < 8) {
+        int box_x = x_cols[current_block] - 16; 
+        int box_y = start_y + 26; 
+        int box_h = max_y - box_y - 5; 
+        it.rectangle(box_x, box_y, 32, box_h, red);
+        it.rectangle(box_x - 1, box_y - 1, 34, box_h + 2, red);
+      }
+      
+      // Space for facts at the bottom when few birds are displayed
+      if (active_bird_count > 0 && active_bird_count <= 5 && id(bird_fact).state.length() > 5) {
+        print_wrapped_centered(200, max_y + 25, id(font_data), black, id(bird_fact).state, 380);
+      }
