@@ -1,4 +1,4 @@
-# 🐦 BirdBox – E-Paper Bird Detection Display
+# 🐦 BirdBox – Raspberry & Microphone Enclosure & E-Paper Display
 
 A 3D-printed bird box with an integrated e-paper display, powered by an ESP32 and [BirdNET-Go](https://github.com/tphakala/birdnet-go). The display shows the **Top 10 detected bird species of the day** in a live table, updated every 30 minutes directly from the BirdNET-Go API.
 
